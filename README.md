@@ -2,7 +2,7 @@
 
 Ferricorn
 ---------
-![](images/ferricorn_logo.png)
+![](images/ferricorn_logo2.png)
 
 Ferricorn is a 100% Rust ASGI server.
 It's a experimental project born from a conversation I had during FOSDEM 2025.
