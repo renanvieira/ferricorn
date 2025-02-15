@@ -1,3 +1,7 @@
+use std::sync::mpsc::Sender;
+
+use hyper::{body::Bytes, HeaderMap, Method, Uri};
+
 #[derive(Debug)]
 pub enum ASGIMessages {
     HttpResponseStart(HttpResponseStart),
@@ -43,5 +47,31 @@ impl HttpResponseStart {
 
     pub fn set_trailers(&mut self, trailers: bool) {
         self.trailers = trailers;
+    }
+}
+
+pub struct ParsedRequest {
+    pub headers: HeaderMap,
+    pub method: Method,
+    pub uri: Uri,
+    pub body: Bytes,
+    pub callback: Sender<ASGIMessages>,
+}
+
+impl ParsedRequest {
+    pub fn new(
+        headers: HeaderMap,
+        method: Method,
+        uri: Uri,
+        body: Bytes,
+        callback: Sender<ASGIMessages>,
+    ) -> Self {
+        Self {
+            headers,
+            method,
+            uri,
+            body,
+            callback,
+        }
     }
 }
