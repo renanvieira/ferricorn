@@ -1,0 +1,19 @@
+[package]
+name = "ferricorn"
+version = "0.0.1"
+edition = "2021"
+license-file = "LICENSE"
+
+[dependencies]
+http-body-util = "0.1.2"
+hyper = { version = "1.5.2", features = ["full", "http1", "http2", "server"] }
+hyper-util = { version = "0.1.10", features = ["full"] }
+pyo3 = { version = "0.23.4", features = [
+    "abi3",
+    "extension-module",
+    "auto-initialize",
+] }
+tokio = { version = "1.43.0", features = ["full"] }
+
+[build-dependencies]
+pyo3-build-config = "0.23.4"
