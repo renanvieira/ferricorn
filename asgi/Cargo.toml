@@ -1,5 +1,5 @@
 [package]
-name = "ferricorn"
+name = "asgi"
 version = "0.0.1"
 edition = "2021"
 license-file = "LICENSE"
@@ -16,4 +16,13 @@ pyo3 = { version = "0.23.4", features = [
 tokio = { version = "1.43.0", features = ["full"] }
 
 [build-dependencies]
-pyo3-build-config = "0.23.4"
+pyo3-build-config = { version = "0.23.4", features = [
+    "abi3",
+    "extension-module",
+] }
+
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]
+
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]
