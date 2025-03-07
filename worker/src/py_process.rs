@@ -1,20 +1,21 @@
 use std::{
-    sync::{
-        mpsc::{self, Sender},
-        Arc,
-    },
+    io::Write as _,
+    os::unix::net::UnixStream,
+    sync::{mpsc, Arc},
     thread,
 };
 
+use crossbeam_channel::Sender;
 use pyo3::{
     types::{
         PyAnyMethods, PyBytes, PyCFunction, PyDict, PyList, PyListMethods, PyModule, PyString,
         PyTuple,
     },
-    Bound, Py, PyAny, PyResult, Python,
+    Bound, IntoPyObjectExt, Py, PyAny, PyResult, Python,
 };
 
-use crate::types::{ASGIMessages, HttpResponseBody, HttpResponseStart, ParsedRequest};
+use messages::types::{ASGIMessages, HttpResponseBody, HttpResponseStart, ParsedRequest};
+use tokio::io::AsyncWriteExt;
 
 pub struct PythonProcess;
 
@@ -22,11 +23,12 @@ impl PythonProcess {
     pub fn start(
         app_module: String,
         asgi_attr: String,
-    ) -> Result<Sender<ParsedRequest>, Box<dyn std::error::Error>> {
+        asgi_sender: Sender<ASGIMessages>,
+    ) -> Result<mpsc::Sender<ParsedRequest>, Box<dyn std::error::Error>> {
         let (tx, rx) = mpsc::channel::<ParsedRequest>();
 
         thread::spawn(move || {
-
+            dbg!(" starting python");
             Python::with_gil(|py| {
                 dbg!(" python started");
                 let app_module_arc = Arc::new(app_module);
@@ -61,22 +63,18 @@ impl PythonProcess {
 
                     let _ = scope.set_item("asgi", asgi);
                     let _ = scope.set_item("http_version", "1.1");
-                    let _ = scope.set_item("method", request_data.method.as_str());
-                    if let Some(scheme) = request_data.uri.scheme() {
-                        let _ = scope.set_item("scheme", scheme.to_string().as_str());
-                    }
+                    let _ = scope.set_item("method", request_data.method.to_string());
+                    let _ = scope.set_item("scheme", request_data.uri.scheme());
                     let _ = scope.set_item("path", request_data.uri.path());
                     let _ = scope.set_item("raw_path", request_data.uri.path().as_bytes());
-                    let _ = scope.set_item("query_string", request_data.uri.query());
+                    let _ = scope.set_item("query_string", request_data.uri.query_string());
                     let _ = scope.set_item("root_path", "");
 
                     let scope_headers = PyList::empty(py);
 
                     for (name, val) in request_data.headers {
-                        let _ = scope_headers.append(
-                            PyTuple::new(py, [name.unwrap().as_str().as_bytes(), val.as_bytes()])
-                                .unwrap(),
-                        );
+                        let _ = scope_headers
+                            .append(PyTuple::new(py, [name.as_bytes(), val.as_bytes()]).unwrap());
                     }
 
                     let _ = scope.set_item("headers", scope_headers);
@@ -111,6 +109,8 @@ impl PythonProcess {
                     };
 
                     // let tx_for_send = Arc::clone(&data.callback);
+
+                    let clone = asgi_sender.clone();
                     let send_callback = move |args: &Bound<'_, PyTuple>,
                                               _kwargs: Option<&Bound<'_, PyDict>>|
                           -> PyResult<Py<PyAny>> {
@@ -120,6 +120,7 @@ impl PythonProcess {
                             let data_type = data_type_result.extract::<String>().unwrap();
 
                             let data_type_ref = data_type.as_str();
+                            dbg!(&data_type_ref);
 
                             match data_type_ref {
                                 "http.response.start" => {
@@ -128,22 +129,24 @@ impl PythonProcess {
                                         data.get_item("status").unwrap().extract::<u16>().unwrap(),
                                     );
 
-                                    dbg!(&start);
-                                    request_data
-                                        .callback
-                                        .send(ASGIMessages::HttpResponseStart(start))
-                                        .unwrap();
+                                    clone.send(ASGIMessages::HttpResponseStart(start));
+                                    // request_data
+                                    // j
+                                    //     .callback
+                                    //     .send(ASGIMessages::HttpResponseStart(start))
+                                    //     .unwrap();
                                 }
                                 "http.response.body" => {
                                     let body_bytes = data.get_item("body").unwrap();
                                     let body_vec = body_bytes.extract::<Vec<u8>>();
 
                                     let body = HttpResponseBody::new(body_vec.unwrap());
+                                    clone.send(ASGIMessages::HttpResponseBody(body)).unwrap();
 
-                                    request_data
-                                        .callback
-                                        .send(ASGIMessages::HttpResponseBody(body))
-                                        .unwrap();
+                                    // request_data
+                                    //     .callback
+                                    //     .send(ASGIMessages::HttpResponseBody(body))
+                                    //     .unwrap();
                                 }
                                 _ => {
                                     dbg!(data);
@@ -192,7 +195,6 @@ impl PythonProcess {
                         .unwrap();
 
                     event_loop.call_method0("close").unwrap();
-                    let _ = py.check_signals();
                 }
             });
         });

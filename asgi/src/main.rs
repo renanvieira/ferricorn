@@ -1,8 +1,8 @@
-mod py_process;
-pub mod types;
-
+use std::collections::HashMap;
 use std::env;
+use std::io::{stderr, stdout};
 use std::net::SocketAddr;
+use std::process::{Command, Stdio};
 use std::sync::mpsc::Sender;
 
 use http_body_util::{BodyExt, Full};
@@ -12,92 +12,126 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{HeaderMap, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
-use py_process::PythonProcess;
-use tokio::net::TcpListener;
-use types::{ASGIMessages, ParsedRequest};
+use messages::types::{ASGIMessages, HttpMethod, ParsedRequest, Uri};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, UnixStream};
 
 async fn process_request(
     req: Request<hyper::body::Incoming>,
-    asgi_tx: Sender<ParsedRequest>,
+    sock_file: String,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    let headers = req.headers().to_owned();
-    let method = req.method().to_owned();
-    let uri = req.uri().to_owned();
-    let body = req.collect().await.unwrap().to_bytes();
-    let (resp_tx, resp_rx) = std::sync::mpsc::channel::<Response<Full<Bytes>>>();
-    let (tx, rx) = std::sync::mpsc::channel::<ASGIMessages>();
+    let headers: HashMap<String, String> = req
+        .headers()
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_str().unwrap().to_string()))
+        .collect();
 
-    let request = ParsedRequest::new(headers, method, uri, body, tx);
+    let method = HttpMethod::try_from(req.method().to_string()).unwrap();
+    let scheme = req.uri().scheme().map(|s| s.to_string());
+    let path = req.uri().path().to_string();
+    let query_string = req.uri().query().map(|str| str.to_string());
 
-    asgi_tx.send(request).unwrap();
+    let uri = Uri::new(scheme, path, query_string);
+    let body = req.collect().await.unwrap().to_bytes().to_vec();
 
-    let join_handle = tokio::spawn(async move {
-        let mut status_code = StatusCode::INTERNAL_SERVER_ERROR;
-        let mut headers = HeaderMap::new();
+    let request = ParsedRequest::new(headers, method, body, uri);
 
-        while let Ok(msg) = rx.recv() {
-            match msg {
-                ASGIMessages::HttpResponseStart(http_response_start) => {
-                    dbg!(&http_response_start);
-                    status_code = StatusCode::from_u16(http_response_start.status).unwrap();
-                    for (n, v) in http_response_start.headers {
-                        headers.insert(
-                            HeaderName::from_bytes(&n).unwrap(),
-                            HeaderValue::from_bytes(&v).unwrap(),
-                        );
-                    }
-                }
-                ASGIMessages::HttpResponseBody(http_response_body) => {
-                    let mut response = Response::builder();
-                    let headers_resp = response.headers_mut().unwrap();
+    let mut stream = UnixStream::connect(sock_file).await.unwrap();
 
-                    for (k, v) in headers.clone() {
-                        if let (Some(key), value) = (k, v) {
-                            headers_resp.insert(key, value);
-                        }
-                    }
+    let payload = bincode::serialize(&request).unwrap();
+    dbg!("Sending payload", &request);
+    stream
+        .write_all(&(payload.len() as u32).to_be_bytes())
+        .await
+        .unwrap();
+    stream.write_all(&payload).await.unwrap();
+    dbg!(" payload sent  to worker");
 
-                    let response = response
-                        .status(status_code)
-                        .body(Full::from(Bytes::from(http_response_body.body)))
-                        .unwrap();
-                    resp_tx.send(response).unwrap();
-                    break;
+    let mut status_code = StatusCode::INTERNAL_SERVER_ERROR;
+    let mut headers = HeaderMap::new();
+    let mut response = Response::builder()
+        .status(status_code)
+        .body(Full::new(Bytes::from("")))
+        .unwrap();
+
+    loop {
+        dbg!("waiting response");
+        let mut buf_len = [0u8; 4];
+        stream.read_exact(&mut buf_len).await.unwrap();
+
+        let lenght = u32::from_be_bytes(buf_len) as usize;
+        let mut payload_buf = vec![0u8; lenght];
+
+        stream.read_exact(&mut payload_buf).await.unwrap();
+
+        let msg = bincode::deserialize::<ASGIMessages>(&payload_buf).unwrap();
+
+        match msg {
+            ASGIMessages::HttpResponseStart(http_response_start) => {
+                dbg!(&http_response_start);
+                status_code = StatusCode::from_u16(http_response_start.status).unwrap();
+                for (n, v) in http_response_start.headers {
+                    headers.insert(
+                        HeaderName::from_bytes(&n).unwrap(),
+                        HeaderValue::from_bytes(&v).unwrap(),
+                    );
                 }
             }
+            ASGIMessages::HttpResponseBody(http_response_body) => {
+                let mut builder = Response::builder();
+                let headers_resp = builder.headers_mut().unwrap();
+
+                for (k, v) in headers.clone() {
+                    if let (Some(key), value) = (k, v) {
+                        headers_resp.insert(key, value);
+                    }
+                }
+
+                response = builder
+                    .status(status_code)
+                    .body(Full::new(Bytes::from(http_response_body.body)))
+                    .unwrap();
+                break;
+            }
         }
-    });
+    }
 
-    join_handle.await.unwrap();
-
-    Ok(resp_rx.recv().unwrap())
+    Ok(response)
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let args: Vec<String> = env::args().collect();
-    let (module, asgi_attr) = args[1].split_once(":").unwrap();
-
     let addr = SocketAddr::from(([127, 0, 0, 1], 3100));
-
     let listener = TcpListener::bind(addr).await?;
-    let python_worker_tx = PythonProcess::start(module.to_owned(), asgi_attr.to_owned()).unwrap();
+
+    let sock_file = "/tmp/ferricorn_worker";
+    tokio::spawn(async move {
+        let mut child = Command::new("cargo")
+            .args([
+                "run", "-p", "worker", "--", "--module", &args[1], "--sock", sock_file,
+            ])
+            .stdout(stdout())
+            .stderr(stderr())
+            .spawn()
+            .expect("couldn't start worker");
+
+        dbg!(child.id());
+        let exit_code = child.wait().expect("worker not running");
+        dbg!("child process exited with  {}", exit_code);
+    });
 
     loop {
         let (stream, _) = listener.accept().await?;
-        let iteration_tx = python_worker_tx.clone();
 
         let io = TokioIo::new(stream);
 
         tokio::task::spawn(async move {
-            let service = service_fn(move |req: Request<Incoming>| {
-                let iteration_tx_clone = iteration_tx.clone();
-                async move {
-                    let response_result = process_request(req, iteration_tx_clone).await;
-                    match response_result {
-                        Ok(response) => Ok(response),
-                        Err(err) => Err(err),
-                    }
+            let service = service_fn(move |req: Request<Incoming>| async move {
+                let response_result = process_request(req, sock_file.to_string()).await;
+                match response_result {
+                    Ok(response) => Ok(response),
+                    Err(err) => Err(err),
                 }
             });
 
