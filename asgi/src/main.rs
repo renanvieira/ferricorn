@@ -1,9 +1,10 @@
 use std::collections::HashMap;
-use std::env;
 use std::io::{stderr, stdout};
 use std::net::SocketAddr;
 use std::process::{Command, Stdio};
 use std::sync::mpsc::Sender;
+use std::sync::{Arc, LazyLock};
+use std::{env, os};
 
 use http_body_util::{BodyExt, Full};
 use hyper::body::{Bytes, Incoming};
@@ -15,6 +16,7 @@ use hyper_util::rt::TokioIo;
 use messages::types::{ASGIMessages, HttpMethod, ParsedRequest, Uri};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UnixStream};
+use tokio::sync::Mutex;
 
 async fn process_request(
     req: Request<hyper::body::Incoming>,
@@ -49,10 +51,6 @@ async fn process_request(
 
     let mut status_code = StatusCode::INTERNAL_SERVER_ERROR;
     let mut headers = HeaderMap::new();
-    let mut response = Response::builder()
-        .status(status_code)
-        .body(Full::new(Bytes::from("")))
-        .unwrap();
 
     loop {
         dbg!("waiting response");
@@ -87,16 +85,13 @@ async fn process_request(
                     }
                 }
 
-                response = builder
+                return Ok(builder
                     .status(status_code)
                     .body(Full::new(Bytes::from(http_response_body.body)))
-                    .unwrap();
-                break;
+                    .unwrap());
             }
         }
     }
-
-    Ok(response)
 }
 
 #[tokio::main]
@@ -104,34 +99,63 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let args: Vec<String> = env::args().collect();
     let addr = SocketAddr::from(([127, 0, 0, 1], 3100));
     let listener = TcpListener::bind(addr).await?;
+    let worker_count = args.get(2).map_or("1", |v| v).parse::<usize>().unwrap();
 
     let sock_file = "/tmp/ferricorn_worker";
-    tokio::spawn(async move {
-        let mut child = Command::new("cargo")
-            .args([
-                "run", "-p", "worker", "--", "--module", &args[1], "--sock", sock_file,
-            ])
-            .stdout(stdout())
-            .stderr(stderr())
-            .spawn()
-            .expect("couldn't start worker");
+    let workers: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
 
-        dbg!(child.id());
-        let exit_code = child.wait().expect("worker not running");
-        dbg!("child process exited with  {}", exit_code);
-    });
+    for i in 0..worker_count {
+        let module = args[1].clone();
+        let sock_file = format!("{}_{}", sock_file, i);
+        let workers = Arc::clone(&workers);
+
+        tokio::spawn(async move {
+            let mut child = Command::new("cargo")
+                .args([
+                    "run", "-p", "worker", "--", "--module", &module, "--sock", &sock_file,
+                ])
+                .stdout(stdout())
+                .stderr(stderr())
+                .spawn()
+                .expect("couldn't start worker");
+
+            dbg!(child.id());
+            {
+                let mut workers = workers.lock().await;
+                workers.push(sock_file.clone());
+            }
+            let exit_code = child.wait().expect("worker not running");
+            dbg!("child process exited with  {}", exit_code);
+
+            {
+                let mut workers = workers.lock().await;
+                let position = workers
+                    .iter()
+                    .position(|w| *w == sock_file)
+                    .expect("worker file not found in list of actrive workers");
+
+                workers.remove(position);
+            }
+        });
+    }
 
     loop {
         let (stream, _) = listener.accept().await?;
 
         let io = TokioIo::new(stream);
+        let workers = Arc::clone(&workers);
 
         tokio::task::spawn(async move {
-            let service = service_fn(move |req: Request<Incoming>| async move {
-                let response_result = process_request(req, sock_file.to_string()).await;
-                match response_result {
-                    Ok(response) => Ok(response),
-                    Err(err) => Err(err),
+            let service = service_fn(move |req: Request<Incoming>| {
+                let inner_workers = Arc::clone(&workers);
+
+                async move {
+                    let sock_file = round_robin(&inner_workers).await;
+                    let response_result = process_request(req, sock_file.to_string()).await;
+                    match response_result {
+                        Ok(response) => Ok(response),
+                        Err(err) => Err(err),
+                    }
                 }
             });
 
@@ -140,4 +164,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         });
     }
+}
+
+static NEXT_WORKER: LazyLock<Arc<Mutex<usize>>> = LazyLock::new(|| Arc::new(Mutex::new(0)));
+
+async fn round_robin(workers: &Arc<Mutex<Vec<String>>>) -> String {
+    let mut next_worker_index = NEXT_WORKER.lock().await;
+    let workers = workers.lock().await;
+
+    let next_worker = workers.get(*next_worker_index).unwrap();
+
+    *next_worker_index += 1;
+
+    if *next_worker_index >= workers.len() {
+        *next_worker_index = 0;
+    }
+
+    next_worker.to_owned()
 }
