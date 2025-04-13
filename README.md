@@ -15,8 +15,3 @@ $ cargo run -- "echo_server:app"
 ```
 
 This command will run the echo server included in the repository.
-
-
-## Architecture
-
-The core idea is to have a Python interpreter per thread. The HTTP connections are all handled with Tokio Async and communicated with the thread that runs Python through a `mpsc` channel.
